@@ -14,6 +14,7 @@
 #include "openrac/mod.hpp"
 #include "openrac/games/rac1.hpp"
 #include "logic.hpp"
+#include "restart_checkpoint.hpp"
 
 namespace {
 enum class View {
@@ -50,6 +51,17 @@ std::string plugins_json;
 bool auto_checkpoint = true;
 
 bool pending_restart = false;
+qol::CheckpointRestart checkpoint_restart;
+constexpr std::uint32_t kRestartCheckpoint = 0x43504B54;
+bool checkpoint_question = false;
+int checkpoint_question_level = -1;
+std::uint32_t checkpoint_question_loads = 0;
+std::string checkpoint_feedback;
+
+bool has_checkpoint_restart() {
+    return qol::has_native_checkpoint_restart(g->api());
+}
+
 bool pending_checkpoint_save = false;
 bool pending_checkpoint_load = false;
 bool pending_autosave = false;
@@ -481,7 +493,15 @@ void handle_choose(const openrac::UiPage& page, int item) {
                 pending_restart = true;
                 view = View::Hub;
                 page.back();
-            } else if (item == 2) {
+            } else if (item == 1 && has_checkpoint_restart()
+                       && qol::CheckpointRestart::allowed(status)
+                       && !checkpoint_restart.pending()) {
+                checkpoint_question = page.confirm(
+                    "Return to the last game checkpoint as after a death?", kRestartCheckpoint);
+                checkpoint_question_level = status.level;
+                checkpoint_question_loads = status.loads;
+                if (!checkpoint_question) checkpoint_feedback = "Could not open confirmation";
+            } else if (item == 3) {
                 view = View::Hub;
             }
             break;
@@ -636,10 +656,14 @@ openrac::UiContent content_for_view() {
             c.title = "Gameplay Tools";
             c.items = {
                 openrac::UiItem::button("Restart current planet", playing(status)),
+                openrac::UiItem::button("Restart checkpoint", has_checkpoint_restart()
+                    && qol::CheckpointRestart::allowed(status) && !checkpoint_restart.pending()),
                 openrac::UiItem::text("Deaths this session: " + std::to_string(deaths)),
                 openrac::UiItem::button("Back to QoL Hub", true)
             };
-            c.footer = {"Death Improvements is absorbed; cutscene safety stays separate"};
+            c.footer = {has_checkpoint_restart()
+                ? (checkpoint_feedback.empty() ? "Checkpoint restart uses the game's normal death rules" : checkpoint_feedback)
+                : "Restart checkpoint requires OpenRAC API 1.14+"};
             break;
 
         case View::Vendor:
@@ -755,6 +779,19 @@ void load(openrac::Mod& mod) {
     hub = mod.ui_page([](const openrac::UiPage& page, const openrac::UiEvent& event) {
         if (event.is(OPENRAC_UI_SHOW)) { refresh_plugin_config(); view = View::Hub; }
         if (event.is(OPENRAC_UI_CHOOSE)) handle_choose(page, event.item());
+        if (event.is(OPENRAC_UI_ANSWER) && event.tag() == kRestartCheckpoint && checkpoint_question) {
+            checkpoint_question = false;
+            const auto status = g->play_status();
+            if (event.value() == 1 && has_checkpoint_restart()
+                && qol::CheckpointRestart::allowed(status)
+                && status.level == checkpoint_question_level && status.loads == checkpoint_question_loads) {
+                checkpoint_restart.request(status);
+                checkpoint_feedback.clear();
+                view = View::Hub;
+                page.back();
+            }
+        }
+        if (event.is(OPENRAC_UI_HIDE)) checkpoint_question = false;
         page.set(content_for_view());
     });
     collectibles_page = mod.ui_page([](const openrac::UiPage& page, const openrac::UiEvent&) {
@@ -800,6 +837,7 @@ void load(openrac::Mod& mod) {
         if (qol::combo_pressed(now, previous_buttons, mask)) pending_open = true;
         if ((now & mask) == mask) qol::consume_buttons(report, mask);
         previous_buttons = now;
+        checkpoint_restart.pad(g->play_status(), report, size);
     });
 
     mod.on_tick_boundary([](std::uint32_t) {
@@ -819,6 +857,22 @@ void load(openrac::Mod& mod) {
                                           : "No active objective";
         }
         if (status.phase == OPENRAC_PLAY_PLAYING) ++settled;
+
+        const bool restarting = checkpoint_restart.pending();
+        if (checkpoint_restart.tick(status)) {
+            restore_options_layout();
+            // RESPAWN invokes Hero_OnKilled and the game's checkpoint path.
+            // Never use play_travel, save loading, or a custom snapshot here.
+            if (!qol::restart_native_checkpoint(g->api(), g->handle())) {
+                checkpoint_feedback = "Checkpoint restart is unavailable right now";
+                g->info(checkpoint_feedback);
+            }
+            return;
+        }
+        if (restarting && !checkpoint_restart.pending()) {
+            checkpoint_feedback = "Checkpoint restart cancelled: game state changed or menu did not close";
+            g->info(checkpoint_feedback);
+        }
 
         openrac_pose pose{};
         pose.size = sizeof pose;
